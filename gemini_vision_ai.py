@@ -27,13 +27,23 @@ Return ONLY valid JSON, no other text.
 
 
 def get_client():
-    """获取配置了 API Key 的 Gemini 客户端"""
+    """使用环境变量 GEMINI_API_KEY；若设置 GOOGLE_GEMINI_BASE_URL 则走中转站。"""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError(
             "未设置 GEMINI_API_KEY。请在终端执行: $env:GEMINI_API_KEY=\"你的密钥\""
         )
+    base_url = os.environ.get("GOOGLE_GEMINI_BASE_URL")
+    if base_url:
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(base_url=base_url.rstrip("/")),
+        )
     return genai.Client(api_key=api_key)
+
+
+def _model_name():
+    return os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 
 def parse_gemini_response(text: str) -> list[dict]:
@@ -171,9 +181,9 @@ def draw_markers_on_image(image: Image.Image, points: list[dict]) -> Image.Image
 
 
 def run_gemini_detection(client, image_bytes: bytes) -> tuple[list[dict], str]:
-    """调用 Gemini Robotics-ER 进行检测，返回 (解析结果, 原始响应文本)"""
+    """调用 Gemini 进行检测，返回 (解析结果, 原始响应文本)"""
     response = client.models.generate_content(
-        model="gemini-robotics-er-1.5-preview",
+        model=_model_name(),
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
             PROMPT,
@@ -230,7 +240,7 @@ def main():
         else:
             st.info("点击上方按钮开始检测")
 
-    st.caption("使用 gemini-robotics-er-1.5-preview 模型")
+    st.caption("使用 " + _model_name() + " 模型")
 
 
 if __name__ == "__main__":

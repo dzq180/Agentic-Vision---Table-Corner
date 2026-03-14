@@ -1,7 +1,8 @@
 """
-基于 Gemini Robotics-ER 1.5，在 Blender 正交相机拍摄的图中精确定位桌面四个角点。
-利用正交投影下桌面呈平行四边形的几何性质，结合 pointing 与推理（含遮挡角点的几何推算）。
-对 table1 / table2 / table3 / table4 进行测试；table.png 为红点角点标记示例参考。
+在 Blender 正交相机拍摄的图中精确定位桌子的四个角点。
+目标不变（识别桌子四角），方法上：(1) 增强定位已有像素：坐标裁剪、按位置排序、提示词要求小数精确定位，可选 OpenCV 边缘细化；
+(2) 已有信息+几何常识+数学推理：桌面为平面→正交下呈平行四边形，对角线交于中心，三点推第四点，代码强制平行四边形。
+对 table1 / table2 / table3 / table4 等测试；table.png 为红点角点标记示例。
 """
 import os
 import re
@@ -16,95 +17,76 @@ from google.genai import types
 
 BASE_DIR = Path(__file__).resolve().parent
 # 测试用图：table1–4；table.png 为红点角点标记示例（若有则可选）
-TABLE_IMAGES = ["table1.png", "table2.jpg", "table3.jpg", "table4.png", "table.png", "table5.jpg"]
+TABLE_IMAGES = ["table1.png", "table2.jpg", "table3.jpg", "table4.jpg", "table.png", "table5.jpg"]
 
-# 正交相机 + 平行四边形 + 只考虑上桌面 + 三条线段相交定义角点 + 几何推算第四点 + 桌子特征 + 桌角强化
-PROMPT = """This image was taken with an orthographic camera (e.g. from Blender). In orthographic projection the table surface appears as a parallelogram (no perspective distortion).
+# 目标：桌子四角点；方法：强调桌子具有的几何性质，用几何与数学推理定位
+PROMPT = """This image was taken with an orthographic camera (e.g. from Blender). Your task: **locate the 4 corner points of the table** (the tabletop only). Use the **geometric properties of the table** to find them.
 
-Your task: precisely locate the 4 corner points of the **tabletop only** (上桌面). Do not use points on the floor, legs, or objects on the table — only the corners of the top surface.
+**Geometric properties of the table (use these to reason):**
+- The **tabletop is a flat horizontal plane**. In orthographic projection there is no perspective distortion: a flat rectangle in 3D projects to a **parallelogram** in the image (possibly a rectangle). So the table's 4 corners are exactly the **4 vertices of that parallelogram**.
+- A parallelogram has 4 vertices; each vertex is where **two edges of the tabletop boundary meet**. Find the four edges that form the tabletop outline; their endpoints are the table corners.
+- **Parallelogram condition** (in image coordinates): if we label the 4 corners in order corner_0, corner_1, corner_2, corner_3, then opposite sides are parallel iff corner_0 + corner_2 = corner_1 + corner_3. So if one corner is occluded, the 4th is **uniquely determined by geometry**: corner_3 = corner_0 + corner_2 - corner_1, i.e. (y3, x3) = (y0 + y2 - y1, x0 + x2 - x1). **Compute** the missing corner with this formula; do not guess.
 
-Table features that help locate the tabletop (use these as hints):
-- **Flat horizontal surface**: The tabletop is one flat plane; its boundary in the image is a closed quadrilateral. The four corners are the only four points where two tabletop edges meet.
-- **Sharp edge**: The tabletop edge is where the horizontal surface meets the vertical side or leg — look for this clear boundary line (color or brightness change, or a visible crease).
-- **Legs**: Table legs usually meet the tabletop near the corners. The vertical line of a leg can help you find where the top surface ends; the corner lies where two tabletop edges meet, often near where a leg meets the top.
-- **Objects on the table**: Cups, plates, etc. sit on top of the surface; the table extends under them. The corners are on the outer boundary of the table, not at the objects — ignore object outlines.
-- **Uniform region**: The tabletop often has a roughly uniform color or texture inside; the boundary is where this surface ends (e.g. meeting the floor, wall, or leg).
-- **Shadow/highlight**: A shadow or highlight along the table edge can make the boundary line easier to see.
+Use these geometric properties to identify the table's 4 corners: find the parallelogram that is the tabletop, then output its 4 vertices. Ignore corners of objects on the table; only the table's own boundary.
 
-How to identify a true table corner:
-- A corner of the tabletop is where **three line segments meet**: the two edges of the tabletop that form that corner, and the vertical edge of the table at that corner (or the meeting of three visible edges at one point). Look for the intersection of these three segments — this uniquely defines a tabletop corner and avoids confusing other points.
-- Only consider points that lie strictly on the **top surface** of the table (上桌面). This way you can reliably identify at least three visible corners.
+**Further geometry (for reasoning or verification):**
+- The **diagonals** of the table (corner_0–corner_2 and corner_1–corner_3) **intersect at the center** of the parallelogram. Use this to check or infer positions.
+- If **only three corners** are clearly visible, output those three with correct labels; the fourth is uniquely determined by corner_3 = corner_0 + corner_2 - corner_1.
 
-**Corner order (tied to image coordinates — use this to avoid mixing corners):**
-In the image, use the table outline’s position to assign corner_0, corner_1, corner_2, corner_3 unambiguously:
-- **corner_0** = the vertex of the table outline that is **closest to the top-left** of the image (smallest y, then smallest x among the 4 corners). So in normalized coordinates, this corner has the smallest y; if two corners share the same y, pick the one with smaller x.
-- **corner_1** = the vertex **closest to the top-right** (smallest y, largest x).
-- **corner_2** = the vertex **closest to the bottom-right** (largest y, largest x).
-- **corner_3** = the vertex **closest to the bottom-left** (largest y, smallest x).
+**Order by position in the image:**
+- corner_0 = vertex **closest to top-left** (smallest y; if tie, smallest x).
+- corner_1 = **top-right** (smallest y, largest x).
+- corner_2 = **bottom-right** (largest y, largest x).
+- corner_3 = **bottom-left** (largest y, smallest x).
 
-Then the four corners are in order: corner_0 → corner_1 → corner_2 → corner_3, going **clockwise** around the table in the image (top-left, top-right, bottom-right, bottom-left). The "first" table edge is the segment from corner_0 to corner_1 (top edge), the "second" from corner_1 to corner_2 (right), the "third" from corner_2 to corner_3 (bottom), the "fourth" from corner_3 to corner_0 (left).
-
-**Distinguishing the four corners (each corner has a different set of three meeting segments):**
-At each corner, **exactly two** table edges meet plus the **vertical** edge of the table. The **direction** of these three segments is different at each corner — use this to confirm you have the right vertex:
-- **corner_0** (top-left): where the **top** edge (corner_0–corner_1) meets the **left** edge (corner_3–corner_0), plus the vertical at that corner.
-- **corner_1** (top-right): where the **top** edge meets the **right** edge (corner_1–corner_2), plus the vertical.
-- **corner_2** (bottom-right): where the **right** edge meets the **bottom** edge (corner_2–corner_3), plus the vertical.
-- **corner_3** (bottom-left): where the **bottom** edge meets the **left** edge, plus the vertical.
-
-So corner_0 ≠ corner_1 ≠ corner_2 ≠ corner_3: each is the unique vertex with a different pair of table edges (and vertical) meeting. Output each point with the correct label so that corner_0 has smallest y (and smallest x if tie), corner_1 smallest y and largest x, etc.
-
-**Stronger corner cues (use these to refine your choice):**
-- **Edge endpoints**: Each corner is where **two tabletop edges meet**. Mentally follow each visible table edge until it ends — that endpoint is a corner. There are exactly 4 such endpoints forming the table outline.
-- **Not object corners**: Ignore corners of objects ON the table (cup rim, book corner, plate edge). The table corner is on the **table's own** boundary, where the table surface meets the air or the leg.
-- **Sharp turn on boundary**: At a true corner the table boundary makes a **sharp turn** (two edges meet). Any point in the middle of a long straight edge is NOT a corner.
-- **Convex quadrilateral**: The 4 corners are the 4 vertices of the tabletop outline — a single convex quadrilateral with no crossing. They are the extremal points of the table surface in the image.
-- **Do not use**: The center of the table, the center of any object on the table, or any point on the table leg below the table surface. Only the 4 vertices of the tabletop boundary.
-
-Strategy:
-1. Identify the 4 corners using the image-based order above (corner_0 = top-left, corner_1 = top-right, corner_2 = bottom-right, corner_3 = bottom-left). If one corner is occluded, compute it from the other three: corner_3 = corner_0 + (corner_2 - corner_1), i.e. (y3, x3) = (y0 + y2 - y1, x0 + x2 - x1).
-2. Assign each point the correct label so that corner_0 has smallest y (then smallest x), corner_1 smallest y and largest x, corner_2 largest y and largest x, corner_3 largest y and smallest x.
-3. Coordinates: normalized 0-1000, image top-left = (0,0), bottom-right = (1000,1000). Use [y, x] for each point.
+**Precise localization:** Each corner is the **intersection of two straight table edges**. Report coordinates as decimals in 0–1000 (e.g. one decimal place) for precise pixel-level localization. Image top-left = (0,0), bottom-right = (1000,1000). Use [y, x] for each point.
 
 Output: Return ONLY a JSON array of exactly 4 objects, no markdown, no explanation. Format:
 [{"point": [y, x], "label": "corner_0"}, {"point": [y, x], "label": "corner_1"}, {"point": [y, x], "label": "corner_2"}, {"point": [y, x], "label": "corner_3"}]
 
-Critical: The four points MUST form a strict parallelogram (平行四边形). In other words, opposite sides must be parallel: corner_0, corner_1, corner_2, corner_3 in order must satisfy corner_0 + corner_2 = corner_1 + corner_3. If you output 4 points, ensure this relation holds; the standard way is to compute the 4th point from the first three as corner_3 = corner_0 + corner_2 - corner_1.
+The four points MUST form a strict parallelogram (the tabletop in this view). Prefer computing the 4th point from the first three with corner_3 = corner_0 + corner_2 - corner_1 so the condition holds exactly.
 """
 
-# 使用参考图时的提示：第一张为带红点标记的示例，第二张为待检测图；角点顺序与主提示一致
+# 参考图模式：第一张为桌角红点示例，第二张用桌子的几何性质（平行四边形）推理出四角
 PROMPT_WITH_REFERENCE = """You are given TWO images.
 
-**First image**: A reference example. The red dots mark the 4 corner points of the tabletop (上桌面). Use this to see exactly what we mean by "table corner" — where two table edges meet on the top surface, plus the vertical at that corner. The order of the red dots in the reference matches the corner labels below.
+**First image**: A reference. The red dots mark the **4 corner points of the table** (tabletop). The table has the geometric property that its top surface is a flat plane, so in orthographic view it appears as a parallelogram; the red dots are the 4 vertices of that parallelogram. The order matches: corner_0 = top-left, corner_1 = top-right, corner_2 = bottom-right, corner_3 = bottom-left.
 
-**Second image**: The image in which you must find the 4 tabletop corners. Use the **same corner order** as in the main task (so your output is consistent and comparable):
-- **corner_0** = vertex of the table outline **closest to the top-left** of the image (smallest y, then smallest x among the 4 corners).
-- **corner_1** = **top-right** (smallest y, largest x).
-- **corner_2** = **bottom-right** (largest y, largest x).
-- **corner_3** = **bottom-left** (largest y, smallest x).
+**Second image**: Locate the **4 corner points of the table** in this image. Use the **same geometric properties**: the tabletop is a flat plane → in this view it is a parallelogram; the 4 table corners are the 4 vertices; diagonals intersect at center; if only 3 corners visible, the 4th = corner_0 + corner_2 - corner_1. Report coordinates as decimals (0–1000) for precise localization. Order by position: corner_0 = top-left, corner_1 = top-right, corner_2 = bottom-right, corner_3 = bottom-left.
 
-So the order is: corner_0 → corner_1 → corner_2 → corner_3, clockwise in the image (top-left, top-right, bottom-right, bottom-left). Each corner is where a **different pair** of table edges meet (plus the vertical); the three meeting segments have different directions at each corner — do not swap labels.
-
-**Corner identification for the second image:**
-- Each corner = **two tabletop edges meet** (follow each edge to its endpoint). Only the table's own boundary vertices; ignore corners of objects on the table (cup, book, plate).
-- The 4 corners form one convex quadrilateral. At each corner the boundary makes a sharp turn. Do not use the center of the table or any point on the leg below the surface.
-- If the 4th corner is occluded, compute it as corner_3 = corner_0 + corner_2 - corner_1. The four points MUST form a parallelogram.
-
-Return the 4 corners for the **second image only**. Coordinates normalized 0-1000, [y, x] per point. Assign the correct label to each point so that corner_0 has smallest y (then smallest x), corner_1 smallest y and largest x, corner_2 largest y and largest x, corner_3 largest y and smallest x.
-
-Output ONLY a JSON array, no markdown. Format:
+Return the 4 table corners for the **second image only**. Coordinates normalized 0-1000, [y, x] per point. Output ONLY a JSON array, no markdown. Format:
 [{"point": [y, x], "label": "corner_0"}, {"point": [y, x], "label": "corner_1"}, {"point": [y, x], "label": "corner_2"}, {"point": [y, x], "label": "corner_3"}]
 """
 
 REFERENCE_IMAGE_NAME = "table.png"
 
+# 中转站配置：从环境变量读取，未设置则用默认
+def _model_name() -> str:
+    return os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
+
 
 def get_client():
+    """使用环境变量 GEMINI_API_KEY；若设置 GOOGLE_GEMINI_BASE_URL 则走中转站。"""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError(
             "未设置 GEMINI_API_KEY。请在终端执行: $env:GEMINI_API_KEY=\"你的密钥\""
         )
+    base_url = os.environ.get("GOOGLE_GEMINI_BASE_URL")
+    if base_url:
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(base_url=base_url.rstrip("/")),
+        )
     return genai.Client(api_key=api_key)
+
+
+def _clamp_normalized(y: float, x: float) -> tuple[float, float]:
+    """将归一化坐标限制在 [0, 1000]，避免越界与绘图异常。"""
+    return (
+        max(0.0, min(1000.0, float(y))),
+        max(0.0, min(1000.0, float(x))),
+    )
 
 
 def _normalize_point(item: dict) -> tuple[float, float] | None:
@@ -116,7 +98,8 @@ def _normalize_point(item: dict) -> tuple[float, float] | None:
     if point is None and "x" in item and "y" in item:
         point = [item["y"], item["x"]]
     if isinstance(point, (list, tuple)) and len(point) >= 2:
-        return float(point[0]), float(point[1])
+        y, x = float(point[0]), float(point[1])
+        return _clamp_normalized(y, x)
     return None
 
 
@@ -190,16 +173,18 @@ def parse_four_corners(text: str) -> list[tuple[float, float]] | None:
 
 
 def _parse_corner_list(data: list) -> list[tuple[float, float]] | None:
-    """解析角点列表：若存在 corner_0..3 的 label 则按 label 排序后再几何补全，否则按数组顺序。"""
+    """解析角点列表：若有 corner_0..3 的 label 则按 label 排序；否则 4 点时按图像位置排序，再几何补全。"""
     with_labels = _parse_point_list_with_labels(data)
     points_only = [p for p, _ in with_labels]
     if len(points_only) < 3:
         return None
-    # 若 4 个点且 label 恰好为 0,1,2,3 各一，则按 label 排序
     indices = [i for _, i in with_labels if i is not None]
     if len(points_only) == 4 and set(indices) == {0, 1, 2, 3} and len(indices) == 4:
         by_idx = {i: p for p, i in with_labels if i is not None}
         points_only = [by_idx[k] for k in (0, 1, 2, 3)]
+    elif len(points_only) == 4:
+        # 无完整 label 时按图像位置排序为 左上→右上→右下→左下，再强制平行四边形
+        points_only = _sort_four_points_by_position(points_only)
     return _ensure_four_corners(points_only)
 
 
@@ -214,6 +199,18 @@ def _parse_point_list(data: list) -> list[tuple[float, float]]:
     return out
 
 
+def _sort_four_points_by_position(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """将 4 个点按图像位置排序为：左上、右上、右下、左下（corner_0..3），便于几何补全时顺序一致。"""
+    if len(points) != 4:
+        return points
+    by_y = sorted(points, key=lambda p: (p[0], p[1]))
+    top_two = sorted(by_y[:2], key=lambda p: p[1])
+    bottom_two = sorted(by_y[2:], key=lambda p: p[1])
+    top_left, top_right = top_two[0], top_two[1]
+    bottom_left, bottom_right = bottom_two[0], bottom_two[1]
+    return [top_left, top_right, bottom_right, bottom_left]
+
+
 def _ensure_four_corners(points: list[tuple[float, float]]) -> list[tuple[float, float]] | None:
     """若恰好 4 个点则强制为平行四边形（用前三点推算第四点）；若 3 个点则用平行四边形几何补全第 4 点。"""
     if len(points) == 3:
@@ -222,7 +219,7 @@ def _ensure_four_corners(points: list[tuple[float, float]]) -> list[tuple[float,
         y2, x2 = points[2]
         y3 = y0 + y2 - y1
         x3 = x0 + x2 - x1
-        return [points[0], points[1], points[2], (y3, x3)]
+        return [points[0], points[1], points[2], _clamp_normalized(y3, x3)]
     if len(points) == 4:
         # 强制构成平行四边形：用 corner_0, corner_1, corner_2 推算 corner_3
         y0, x0 = points[0]
@@ -230,8 +227,49 @@ def _ensure_four_corners(points: list[tuple[float, float]]) -> list[tuple[float,
         y2, x2 = points[2]
         y3 = y0 + y2 - y1
         x3 = x0 + x2 - x1
-        return [points[0], points[1], points[2], (y3, x3)]
+        return [points[0], points[1], points[2], _clamp_normalized(y3, x3)]
     return None
+
+
+def _refine_corners_with_edges(
+    image: Image.Image, corners: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """可选：用图像边缘细化角点位置（需 OpenCV）。在角点附近搜索最强边缘点，提升像素级定位。"""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return corners
+    if len(corners) != 4:
+        return corners
+    w, h = image.size
+    gray = np.array(image.convert("L"))
+    edges = cv2.Canny(gray, 50, 150)
+    out = []
+    # 在角点附近小窗口内找边缘点，取离原角点最近且边缘强度较高的点
+    radius = max(5, min(w, h) // 80)
+    for (y_norm, x_norm) in corners:
+        x_px = int(x_norm / 1000 * w)
+        y_px = int(y_norm / 1000 * h)
+        x_px = max(radius, min(w - 1 - radius, x_px))
+        y_px = max(radius, min(h - 1 - radius, y_px))
+        roi = edges[
+            y_px - radius : y_px + radius + 1,
+            x_px - radius : x_px + radius + 1,
+        ]
+        ys, xs = np.where(roi > 0)
+        if len(ys) == 0:
+            out.append((y_norm, x_norm))
+            continue
+        # 以原角点为原点，选最近的边缘点（在 roi 内坐标需加偏移）
+        ys_abs = ys + (y_px - radius)
+        xs_abs = xs + (x_px - radius)
+        dists = (xs_abs - x_px) ** 2 + (ys_abs - y_px) ** 2
+        i = np.argmin(dists)
+        y_new = ys_abs[i] / h * 1000.0
+        x_new = xs_abs[i] / w * 1000.0
+        out.append(_clamp_normalized(y_new, x_new))
+    return out
 
 
 def draw_four_corners(image: Image.Image, corners: list[tuple[float, float]]) -> Image.Image:
@@ -282,7 +320,7 @@ def run_gemini_corner_detection(
         ]
 
     response = client.models.generate_content(
-        model="gemini-robotics-er-1.5-preview",
+        model=_model_name(),
         contents=contents,
         config=types.GenerateContentConfig(
             temperature=0.2,
@@ -330,7 +368,7 @@ def main():
         key="use_ref",
     )
     if reference_available and not use_reference:
-        st.caption("勾选后会在请求中附带 table.png，模型可参考红点位置理解桌角定义。")
+        st.caption("勾选后会在请求中附带 table.png，模型可参考红点理解「桌子四角点」的输出格式与顺序。")
 
     with col2:
         st.subheader("四角点检测（红点 + 红色四边形）")
@@ -350,6 +388,9 @@ def main():
                         reference_image_mime=ref_mime,
                     )
                     if corners and len(corners) == 4:
+                        # 可选：用图像边缘细化角点像素位置（有 OpenCV 时自动启用），再强制平行四边形
+                        corners = _refine_corners_with_edges(image, corners)
+                        corners = _ensure_four_corners(corners) or corners
                         marked_image = draw_four_corners(image, corners)
                         st.image(marked_image)
                         st.json({
@@ -373,8 +414,7 @@ def main():
             st.info("点击上方按钮开始检测桌面四角点")
 
     st.caption(
-        "正交相机下桌面为平行四边形；利用几何性质可推算被遮挡角点。"
-        " table.png 为红点角点标记示例。"
+        "目标：识别桌子四角点。方法：利用桌子具有的几何性质（桌面为平面→正交下呈平行四边形），用公式 corner_3 = corner_0 + corner_2 - corner_1 推算被遮挡角点。table.png 为红点角点示例。"
     )
 
 
