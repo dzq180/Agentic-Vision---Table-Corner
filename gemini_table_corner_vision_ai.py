@@ -1,7 +1,8 @@
 """
 在 Blender 正交相机拍摄的图中精确定位桌子的四个角点。
 目标不变（识别桌子四角），方法上：(1) 增强定位已有像素：坐标裁剪、按位置排序、提示词要求小数精确定位，可选 OpenCV 边缘细化；
-(2) 已有信息+几何常识+数学推理：桌面为平面→正交下呈平行四边形，对角线交于中心，三点推第四点，代码强制平行四边形。
+(2) 已有信息+几何常识+数学推理：桌面为平面→正交下呈平行四边形，对角线交于中心，三点推第四点，代码强制平行四边形；
+(3) 分割模型技术：可选「仅分割」或「分割+Gemini」——用 OpenCV 轮廓检测分割桌面区域，凸包取四极值点后平行四边形拟合得到四角点。
 对 table1 / table2 / table3 / table4 等测试；table.png 为红点角点标记示例。
 """
 import os
@@ -25,7 +26,12 @@ PROMPT = """This image was taken with an orthographic camera (e.g. from Blender)
 **Geometric properties of the table (use these to reason):**
 - The **tabletop is a flat horizontal plane**. In orthographic projection there is no perspective distortion: a flat rectangle in 3D projects to a **parallelogram** in the image (possibly a rectangle). So the table's 4 corners are exactly the **4 vertices of that parallelogram**.
 - A parallelogram has 4 vertices; each vertex is where **two edges of the tabletop boundary meet**. Find the four edges that form the tabletop outline; their endpoints are the table corners.
-- **Parallelogram condition** (in image coordinates): if we label the 4 corners in order corner_0, corner_1, corner_2, corner_3, then opposite sides are parallel iff corner_0 + corner_2 = corner_1 + corner_3. So if one corner is occluded, the 4th is **uniquely determined by geometry**: corner_3 = corner_0 + corner_2 - corner_1, i.e. (y3, x3) = (y0 + y2 - y1, x0 + x2 - x1). **Compute** the missing corner with this formula; do not guess.
+- **Parallelogram condition** (in image coordinates): if we label the 4 corners in order corner_0, corner_1, corner_2, corner_3, then opposite sides are parallel iff corner_0 + corner_2 = corner_1 + corner_3. If **one corner is occluded**, do NOT guess its position from object edges — instead, use the other three corners and this equation to COMPUTE the missing corner exactly:
+  - missing corner_0: corner_0 = corner_1 + corner_3 − corner_2
+  - missing corner_1: corner_1 = corner_0 + corner_2 − corner_3
+  - missing corner_2: corner_2 = corner_1 + corner_3 − corner_0
+  - missing corner_3: corner_3 = corner_0 + corner_2 − corner_1
+  For example, if only corner_0, corner_1, corner_2 are clearly visible and corner_3 is fully occluded, you MUST output corner_3 = corner_0 + corner_2 − corner_1, i.e. (y3, x3) = (y0 + y2 − y1, x0 + x2 − x1).
 
 Use these geometric properties to identify the table's 4 corners: find the parallelogram that is the tabletop, then output its 4 vertices. Ignore corners of objects on the table; only the table's own boundary.
 
@@ -231,10 +237,112 @@ def _ensure_four_corners(points: list[tuple[float, float]]) -> list[tuple[float,
     return None
 
 
+def _opencv_available() -> bool:
+    try:
+        import cv2
+        import numpy as np
+        return True
+    except ImportError:
+        return False
+
+
+def _four_corners_from_hull_stable(pts, h: int, w: int) -> list[tuple[float, float]] | None:
+    """从凸包点集用稳定方式取四角：argmin/argmax(y±x)，避免排序歧义。pts 为 Nx2 (x,y)。"""
+    import numpy as np
+    if len(pts) < 4:
+        return None
+    pts = np.asarray(pts, dtype=np.float64)
+    if pts.ndim == 3:
+        pts = pts.reshape(-1, 2)
+    y_vals = pts[:, 1]
+    x_vals = pts[:, 0]
+    y_plus_x = y_vals + x_vals
+    y_minus_x = y_vals - x_vals
+    idx_tl = int(np.argmin(y_plus_x))   # 左上: y+x 最小
+    idx_tr = int(np.argmin(y_minus_x))  # 右上: y-x 最小
+    idx_br = int(np.argmax(y_plus_x))   # 右下: y+x 最大
+    idx_bl = int(np.argmax(y_minus_x))   # 左下: y-x 最大
+    if len({idx_tl, idx_tr, idx_br, idx_bl}) < 4:
+        return None
+    top_left = pts[idx_tl]
+    top_right = pts[idx_tr]
+    bottom_right = pts[idx_br]
+    bottom_left = pts[idx_bl]
+    four = [top_left, top_right, bottom_right, bottom_left]
+    norm = []
+    for px, py in four:
+        ny = float(py) / h * 1000.0
+        nx = float(px) / w * 1000.0
+        norm.append(_clamp_normalized(ny, nx))
+    return _ensure_four_corners(norm)
+
+
+def segment_table_and_get_corners(image: Image.Image) -> list[tuple[float, float]] | None:
+    """用分割（轮廓检测）+ 平行四边形拟合得到桌面四角点。需 OpenCV。失败返回 None。"""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    w, h = image.size
+    if w < 10 or h < 10:
+        return None
+    gray = np.array(image.convert("L"))
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 120)
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10
+    )
+    combined = cv2.bitwise_or(edges, thresh)
+    # 形态学闭运算：弥合细小缝隙，使同一桌面得到稳定单一轮廓
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(
+        combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return None
+    min_area = (w * h) * 0.02
+    # 稳定排序：面积降序，面积相同时按外接矩形 (y,x) 升序，保证同图多次结果一致
+    def contour_sort_key(c):
+        area = cv2.contourArea(c)
+        x_rect, y_rect, _, _ = cv2.boundingRect(c)
+        return (-area, y_rect, x_rect)
+    contours = sorted(contours, key=contour_sort_key)
+    best_result = None
+    best_score = -1.0
+    for cnt in contours:
+        if cv2.contourArea(cnt) < min_area:
+            continue
+        hull = cv2.convexHull(cnt)
+        if len(hull) < 4:
+            continue
+        out = _four_corners_from_hull_stable(hull, h, w)
+        if not out:
+            continue
+        # 选“最像桌面”的轮廓：面积大且凸包紧凑（面积/凸包面积比高）优先
+        hull_area = cv2.contourArea(hull)
+        cnt_area = cv2.contourArea(cnt)
+        if hull_area <= 0:
+            continue
+        ratio = cnt_area / hull_area
+        score = cnt_area * (0.5 + 0.5 * ratio)
+        if score > best_score:
+            best_score = score
+            best_result = out
+    return best_result
+
+
 def _refine_corners_with_edges(
     image: Image.Image, corners: list[tuple[float, float]]
 ) -> list[tuple[float, float]]:
-    """可选：用图像边缘细化角点位置（需 OpenCV）。在角点附近搜索最强边缘点，提升像素级定位。"""
+    """用边缘+亚像素角点细化已知角点位置（需 OpenCV）。
+
+    步骤：
+    1. 在角点附近用 Canny 找最近的边缘点（粗调到真实边界上）。
+    2. 以该点为初值调用 cv2.cornerSubPix 做亚像素角点 refine。
+    最终输出仍做归一化裁剪，避免越界。
+    """
     try:
         import cv2
         import numpy as np
@@ -244,10 +352,11 @@ def _refine_corners_with_edges(
         return corners
     w, h = image.size
     gray = np.array(image.convert("L"))
+    gray_f = gray.astype("float32")
     edges = cv2.Canny(gray, 50, 150)
     out = []
-    # 在角点附近小窗口内找边缘点，取离原角点最近且边缘强度较高的点
-    radius = max(5, min(w, h) // 80)
+    # 在角点附近小窗口内找边缘点，然后用 cornerSubPix 做亚像素 refine
+    radius = max(5, min(w, h) // 60)
     for (y_norm, x_norm) in corners:
         x_px = int(x_norm / 1000 * w)
         y_px = int(y_norm / 1000 * h)
@@ -259,15 +368,27 @@ def _refine_corners_with_edges(
         ]
         ys, xs = np.where(roi > 0)
         if len(ys) == 0:
+            # 没有明显边缘，保持原位置
             out.append((y_norm, x_norm))
             continue
         # 以原角点为原点，选最近的边缘点（在 roi 内坐标需加偏移）
         ys_abs = ys + (y_px - radius)
         xs_abs = xs + (x_px - radius)
         dists = (xs_abs - x_px) ** 2 + (ys_abs - y_px) ** 2
-        i = np.argmin(dists)
-        y_new = ys_abs[i] / h * 1000.0
-        x_new = xs_abs[i] / w * 1000.0
+        i = int(np.argmin(dists))
+        y_edge = int(ys_abs[i])
+        x_edge = int(xs_abs[i])
+        # cornerSubPix 需要 float32 角点输入，形状 (N,1,2)
+        import cv2  # type: ignore[redefined-builtin]
+
+        corners_init = np.array([[[x_edge, y_edge]]], dtype="float32")
+        win_size = (radius, radius)
+        zero_zone = (-1, -1)
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.01)
+        refined = cv2.cornerSubPix(gray_f, corners_init, win_size, zero_zone, crit)
+        x_ref, y_ref = refined[0, 0]
+        y_new = y_ref / h * 1000.0
+        x_new = x_ref / w * 1000.0
         out.append(_clamp_normalized(y_new, x_new))
     return out
 
@@ -370,48 +491,102 @@ def main():
     if reference_available and not use_reference:
         st.caption("勾选后会在请求中附带 table.png，模型可参考红点理解「桌子四角点」的输出格式与顺序。")
 
+    detection_method = st.radio(
+        "检测方式",
+        options=[
+            "Gemini（视觉+几何推理）",
+            "分割初定位 + Gemini 精修（推荐）",
+        ],
+        index=0,
+        key="detection_method",
+        horizontal=True,
+    )
+    # 取消单独的“仅分割”选项：自动模式 = 分割 + 几何 + Gemini 兜底
+    use_segment_then_gemini = detection_method.startswith("分割初定位")
+    if use_segment_then_gemini and not _opencv_available():
+        st.warning("当前未安装 OpenCV（opencv-python、numpy），分割初定位功能不可用。请安装后重试：pip install opencv-python numpy")
+
     with col2:
         st.subheader("四角点检测（红点 + 红色四边形）")
-        if st.button("运行 Gemini 四角点检测", type="primary"):
-            with st.spinner("正在调用 Gemini（含几何推理）..."):
-                try:
-                    client = get_client()
-                    ref_bytes = None
-                    ref_mime = None
-                    if use_reference and reference_available:
-                        with open(BASE_DIR / REFERENCE_IMAGE_NAME, "rb") as f:
-                            ref_bytes = f.read()
-                        ref_mime = get_mime(BASE_DIR / REFERENCE_IMAGE_NAME)
-                    corners, raw_text = run_gemini_corner_detection(
-                        client, image_bytes, mime_type,
-                        reference_image_bytes=ref_bytes,
-                        reference_image_mime=ref_mime,
-                    )
-                    if corners and len(corners) == 4:
-                        # 可选：用图像边缘细化角点像素位置（有 OpenCV 时自动启用），再强制平行四边形
-                        corners = _refine_corners_with_edges(image, corners)
-                        corners = _ensure_four_corners(corners) or corners
-                        marked_image = draw_four_corners(image, corners)
-                        st.image(marked_image)
-                        st.json({
-                            "corners": [
-                                {"point": [round(c[0], 2), round(c[1], 2)], "label": f"corner_{i}"}
-                                for i, c in enumerate(corners)
-                            ],
-                            "说明": "归一化坐标 [y, x]，0-1000",
-                        })
-                        stem = image_path.stem
-                        output_path = BASE_DIR / f"{stem}_table_marked.png"
-                        marked_image.save(output_path)
-                        st.success(f"已保存到新文件: {output_path}（原图未修改）")
-                    else:
-                        st.warning("未解析到有效的 4 个角点")
+        if st.button("运行检测", type="primary"):
+            corners = None
+            raw_text = ""
+            try:
+                if use_segment_then_gemini:
+                    with st.spinner("先分割初定位，再调用 Gemini 精修..."):
+                        seg_corners = segment_table_and_get_corners(image)
+                        if seg_corners and len(seg_corners) == 4:
+                            client = get_client()
+                            ref_bytes = ref_mime = None
+                            if use_reference and reference_available:
+                                with open(BASE_DIR / REFERENCE_IMAGE_NAME, "rb") as f:
+                                    ref_bytes = f.read()
+                                ref_mime = get_mime(BASE_DIR / REFERENCE_IMAGE_NAME)
+                            corners, raw_text = run_gemini_corner_detection(
+                                client, image_bytes, mime_type,
+                                reference_image_bytes=ref_bytes,
+                                reference_image_mime=ref_mime,
+                            )
+                            if corners and len(corners) == 4:
+                                corners = _refine_corners_with_edges(image, corners)
+                                corners = _ensure_four_corners(corners) or corners
+                            else:
+                                corners = seg_corners
+                                raw_text = "（分割成功，Gemini 未返回有效角点，使用分割结果）"
+                        else:
+                            client = get_client()
+                            ref_bytes = ref_mime = None
+                            if use_reference and reference_available:
+                                with open(BASE_DIR / REFERENCE_IMAGE_NAME, "rb") as f:
+                                    ref_bytes = f.read()
+                                ref_mime = get_mime(BASE_DIR / REFERENCE_IMAGE_NAME)
+                            corners, raw_text = run_gemini_corner_detection(
+                                client, image_bytes, mime_type,
+                                reference_image_bytes=ref_bytes,
+                                reference_image_mime=ref_mime,
+                            )
+                            if corners and len(corners) == 4:
+                                corners = _refine_corners_with_edges(image, corners)
+                                corners = _ensure_four_corners(corners) or corners
+                else:
+                    with st.spinner("正在调用 Gemini（含几何推理）..."):
+                        client = get_client()
+                        ref_bytes = ref_mime = None
+                        if use_reference and reference_available:
+                            with open(BASE_DIR / REFERENCE_IMAGE_NAME, "rb") as f:
+                                ref_bytes = f.read()
+                            ref_mime = get_mime(BASE_DIR / REFERENCE_IMAGE_NAME)
+                        corners, raw_text = run_gemini_corner_detection(
+                            client, image_bytes, mime_type,
+                            reference_image_bytes=ref_bytes,
+                            reference_image_mime=ref_mime,
+                        )
+                        if corners and len(corners) == 4:
+                            corners = _refine_corners_with_edges(image, corners)
+                            corners = _ensure_four_corners(corners) or corners
+                if corners and len(corners) == 4:
+                    marked_image = draw_four_corners(image, corners)
+                    st.image(marked_image)
+                    st.json({
+                        "corners": [
+                            {"point": [round(c[0], 2), round(c[1], 2)], "label": f"corner_{i}"}
+                            for i, c in enumerate(corners)
+                        ],
+                        "说明": "归一化坐标 [y, x]，0-1000",
+                    })
+                    stem = image_path.stem
+                    output_path = BASE_DIR / f"{stem}_table_marked.png"
+                    marked_image.save(output_path)
+                    st.success(f"已保存到新文件: {output_path}（原图未修改）")
+                else:
+                    st.warning("未解析到有效的 4 个角点")
+                    if raw_text:
                         with st.expander("查看 API 原始返回", expanded=True):
                             st.code(raw_text or "(空)", language="json")
-                except Exception as e:
-                    st.error(str(e))
+            except Exception as e:
+                st.error(str(e))
         else:
-            st.info("点击上方按钮开始检测桌面四角点")
+            st.info("选择检测方式后点击「运行检测」开始")
 
     st.caption(
         "目标：识别桌子四角点。方法：利用桌子具有的几何性质（桌面为平面→正交下呈平行四边形），用公式 corner_3 = corner_0 + corner_2 - corner_1 推算被遮挡角点。table.png 为红点角点示例。"
