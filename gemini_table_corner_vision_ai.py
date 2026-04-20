@@ -1,8 +1,8 @@
 """
 在 Blender 正交相机拍摄的图中精确定位桌子的四个角点。
 目标不变（识别桌子四角），方法上：(1) 增强定位已有像素：坐标裁剪、按位置排序、提示词要求小数精确定位，可选 OpenCV 边缘细化；
-(2) 已有信息+几何常识+数学推理：桌面为平面→正交下呈平行四边形，对角线交于中心，三点推第四点，代码强制平行四边形；
-(3) 分割模型技术：可选「仅分割」或「分割+Gemini」——用 OpenCV 轮廓检测分割桌面区域，凸包取四极值点后平行四边形拟合得到四角点。
+(2) 已有信息+几何常识+数学推理：桌面为平面→正交下呈平行四边形，对角线交于中心，三点推第四点，代码强制平行四边形（可与「仅大模型」管线对比）；
+(3) 分割模型技术：可选「分割+Gemini」——用 OpenCV 轮廓检测分割桌面区域，凸包取四极值点后平行四边形拟合得到四角点（仅在与「含数学几何推理」同选时启用）。
 对 table1 / table2 / table3 / table4 等测试；table.png 为红点角点标记示例。
 """
 import os
@@ -17,6 +17,9 @@ from google import genai
 from google.genai import types
 
 BASE_DIR = Path(__file__).resolve().parent
+# 测试图集中放在「数据集」子目录；若无该目录则仍从脚本同目录读取（兼容旧布局）
+DATASET_DIR = BASE_DIR / "数据集"
+IMAGE_ROOT = DATASET_DIR if DATASET_DIR.is_dir() else BASE_DIR
 # 测试用图：table1–4；table.png 为红点角点标记示例（若有则可选）
 TABLE_IMAGES = ["table1.png", "table2.jpg", "table3.jpg", "table4.jpg", "table.png", "table5.jpg"]
 
@@ -53,6 +56,23 @@ Output: Return ONLY a JSON array of exactly 4 objects, no markdown, no explanati
 The four points MUST form a strict parallelogram (the tabletop in this view). Prefer computing the 4th point from the first three with corner_3 = corner_0 + corner_2 - corner_1 so the condition holds exactly.
 """
 
+# 对比实验：仅依赖视觉与模型输出，不在提示词中要求平行四边形/向量公式推理
+PROMPT_LLM_ONLY = """This image was taken with an orthographic camera (e.g. from Blender). Your task: **locate the 4 corner points of the table** (the tabletop only — vertices where the top surface outline meets; ignore corners of objects on the table).
+
+Use **pure visual judgment**: estimate each tabletop corner in the image. Do **not** use or mention parallelogram equations, vector sums, or computing a missing corner from three points; output only what you infer from pixels.
+
+**Order by position in the image:**
+- corner_0 = vertex closest to top-left (smallest y; if tie, smallest x).
+- corner_1 = top-right (smallest y, largest x among the upper corners).
+- corner_2 = bottom-right (largest y, largest x).
+- corner_3 = bottom-left (largest y, smallest x).
+
+**Coordinates:** Decimals in 0–1000 for sub-pixel feel. Image top-left = (0,0), bottom-right = (1000,1000). Use [y, x] for each point.
+
+Output: Return ONLY a JSON array of exactly 4 objects, no markdown, no explanation. Format:
+[{"point": [y, x], "label": "corner_0"}, {"point": [y, x], "label": "corner_1"}, {"point": [y, x], "label": "corner_2"}, {"point": [y, x], "label": "corner_3"}]
+"""
+
 # 参考图模式：第一张为桌角红点示例，第二张用桌子的几何性质（平行四边形）推理出四角
 PROMPT_WITH_REFERENCE = """You are given TWO images.
 
@@ -64,6 +84,16 @@ Return the 4 table corners for the **second image only**. Coordinates normalized
 [{"point": [y, x], "label": "corner_0"}, {"point": [y, x], "label": "corner_1"}, {"point": [y, x], "label": "corner_2"}, {"point": [y, x], "label": "corner_3"}]
 """
 
+PROMPT_WITH_REFERENCE_LLM_ONLY = """You are given TWO images.
+
+**First image**: A reference. The red dots mark the **4 corner points of the table** (tabletop). Order: corner_0 = top-left, corner_1 = top-right, corner_2 = bottom-right, corner_3 = bottom-left.
+
+**Second image**: Locate the **4 corner points of the table** in this image using **visual judgment only**, analogous to the first image. Do **not** use parallelogram equations or compute hidden corners from formulas; output coordinates you infer from the second image pixels.
+
+Coordinates: decimals 0–1000, [y, x] per point, same ordering as above. Return the 4 corners for the **second image only**. Output ONLY a JSON array, no markdown. Format:
+[{"point": [y, x], "label": "corner_0"}, {"point": [y, x], "label": "corner_1"}, {"point": [y, x], "label": "corner_2"}, {"point": [y, x], "label": "corner_3"}]
+"""
+
 REFERENCE_IMAGE_NAME = "table.png"
 
 # 中转站配置：从环境变量读取，未设置则用默认
@@ -71,18 +101,40 @@ def _model_name() -> str:
     return os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 
+def _relay_base_url() -> str | None:
+    """中转 Gemini 兼容接口的根地址（不要末尾 /）。支持多个常见环境变量名。"""
+    for key in (
+        "GOOGLE_GEMINI_BASE_URL",
+        "GEMINI_BASE_URL",
+        "GOOGLE_GENAI_BASE_URL",
+    ):
+        url = os.environ.get(key)
+        if url and str(url).strip():
+            return str(url).strip().rstrip("/")
+    return None
+
+
 def get_client():
-    """使用环境变量 GEMINI_API_KEY；若设置 GOOGLE_GEMINI_BASE_URL 则走中转站。"""
+    """使用 GEMINI_API_KEY；若设置中转 base URL（_relay_base_url）则请求发往中转站。
+
+    中转站密钥多为 sk- 开头，与官方 Google AI 密钥格式不同，可直接作为 GEMINI_API_KEY。
+    base URL 须与服务商文档一致（须兼容 google-genai 调用的 Gemini API 路径，不是 OpenAI 的 /v1/chat）。
+    """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError(
-            "未设置 GEMINI_API_KEY。请在终端执行: $env:GEMINI_API_KEY=\"你的密钥\""
+            "未设置 GEMINI_API_KEY。\n"
+            "PowerShell 示例（中转站）：\n"
+            '  $env:GEMINI_API_KEY="sk-你的令牌"\n'
+            '  $env:GOOGLE_GEMINI_BASE_URL="https://控制台域名"   # 按服务商「Gemini / google-genai」文档填写，无尾斜杠\n'
+            "也可用 GEMINI_BASE_URL，与 GOOGLE_GEMINI_BASE_URL 等价。\n"
+            "模型名需与中转可用列表一致，例如: $env:GEMINI_MODEL=\"gemini-2.0-flash\""
         )
-    base_url = os.environ.get("GOOGLE_GEMINI_BASE_URL")
+    base_url = _relay_base_url()
     if base_url:
         return genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(base_url=base_url.rstrip("/")),
+            http_options=types.HttpOptions(base_url=base_url),
         )
     return genai.Client(api_key=api_key)
 
@@ -134,8 +186,12 @@ def _parse_point_list_with_labels(data: list) -> list[tuple[tuple[float, float],
     return out
 
 
-def parse_four_corners(text: str) -> list[tuple[float, float]] | None:
-    """解析返回的 4 个角点 [y,x]，归一化 0-1000。若只有 3 个点则用平行四边形几何补全第 4 点。"""
+def parse_four_corners(text: str, *, apply_geometry: bool = True) -> list[tuple[float, float]] | None:
+    """解析返回的 4 个角点 [y,x]，归一化 0-1000。
+
+    apply_geometry=True：解析返回的 4 个角点 [y,x]，归一化 0-1000。若只有 3 个点则用平行四边形几何补全第 4 点。
+    apply_geometry=False：仅大模型对比模式，不补点、不强制平行四边形，须恰好解析到 4 个点。
+    """
     if not text or not text.strip():
         return None
     text = text.strip()
@@ -153,7 +209,7 @@ def parse_four_corners(text: str) -> list[tuple[float, float]] | None:
         try:
             data = json.loads(text)
             if isinstance(data, list):
-                return _parse_corner_list(data)
+                return _parse_corner_list(data, apply_geometry=apply_geometry)
             return None
         except json.JSONDecodeError:
             return None
@@ -171,27 +227,44 @@ def parse_four_corners(text: str) -> list[tuple[float, float]] | None:
                 try:
                     data = json.loads(json_str)
                     if isinstance(data, list):
-                        return _parse_corner_list(data)
+                        return _parse_corner_list(data, apply_geometry=apply_geometry)
                 except json.JSONDecodeError:
                     pass
                 break
     return None
 
 
-def _parse_corner_list(data: list) -> list[tuple[float, float]] | None:
-    """解析角点列表：若有 corner_0..3 的 label 则按 label 排序；否则 4 点时按图像位置排序，再几何补全。"""
+def _parse_corner_list(
+    data: list, *, apply_geometry: bool = True
+) -> list[tuple[float, float]] | None:
+    """解析角点列表：若有 corner_0..3 的 label 则按 label排序；否则 4 点时按图像位置排序，再几何补全。。
+
+    apply_geometry 为 True 时再做 _ensure_four_corners（含 3→4 补点）；为 False 时仅接受模型给出的 4 点，不强制平行四边形。
+    """
     with_labels = _parse_point_list_with_labels(data)
     points_only = [p for p, _ in with_labels]
-    if len(points_only) < 3:
+    min_len = 3 if apply_geometry else 4
+    if len(points_only) < min_len:
         return None
+
     indices = [i for _, i in with_labels if i is not None]
+    by_idx = {i: p for p, i in with_labels if i is not None}
+
     if len(points_only) == 4 and set(indices) == {0, 1, 2, 3} and len(indices) == 4:
-        by_idx = {i: p for p, i in with_labels if i is not None}
         points_only = [by_idx[k] for k in (0, 1, 2, 3)]
     elif len(points_only) == 4:
-        # 无完整 label 时按图像位置排序为 左上→右上→右下→左下，再强制平行四边形
         points_only = _sort_four_points_by_position(points_only)
-    return _ensure_four_corners(points_only)
+    elif not apply_geometry and len(points_only) > 4:
+        if set(by_idx.keys()) == {0, 1, 2, 3}:
+            points_only = [by_idx[k] for k in (0, 1, 2, 3)]
+        else:
+            return None
+
+    if apply_geometry:
+        return _ensure_four_corners(points_only)
+    if len(points_only) != 4:
+        return None
+    return points_only
 
 
 def _parse_point_list(data: list) -> list[tuple[float, float]]:
@@ -426,18 +499,29 @@ def run_gemini_corner_detection(
     mime_type: str,
     reference_image_bytes: bytes | None = None,
     reference_image_mime: str | None = None,
+    *,
+    use_geometry_pipeline: bool = True,
 ) -> tuple[list[tuple[float, float]] | None, str]:
-    """调用 Gemini 检测桌面四角点。若提供 reference_image，则先传参考图再传待检测图，用参考图辅助定位。"""
+    """调用 Gemini 检测桌面四角点。若提供 reference_image，则先传参考图再传待检测图，用参考图辅助定位。
+
+    use_geometry_pipeline=False 时使用 PROMPT_LLM_ONLY / 参考图纯视觉版，解析不做平行四边形代码约束。
+    """
     if reference_image_bytes is not None and reference_image_mime:
+        prompt = (
+            PROMPT_WITH_REFERENCE
+            if use_geometry_pipeline
+            else PROMPT_WITH_REFERENCE_LLM_ONLY
+        )
         contents = [
             types.Part.from_bytes(data=reference_image_bytes, mime_type=reference_image_mime),
             types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            PROMPT_WITH_REFERENCE,
+            prompt,
         ]
     else:
+        prompt = PROMPT if use_geometry_pipeline else PROMPT_LLM_ONLY
         contents = [
             types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            PROMPT,
+            prompt,
         ]
 
     response = client.models.generate_content(
@@ -449,7 +533,7 @@ def run_gemini_corner_detection(
         ),
     )
     raw_text = response.text or ""
-    return parse_four_corners(raw_text), raw_text
+    return parse_four_corners(raw_text, apply_geometry=use_geometry_pipeline), raw_text
 
 
 def get_mime(path: Path) -> str:
@@ -462,14 +546,25 @@ def get_mime(path: Path) -> str:
 def main():
     st.set_page_config(page_title="桌面四角点检测", layout="wide")
     st.title("正交相机桌面四角点定位（Gemini Robotics-ER 1.5）")
+    relay_url = _relay_base_url()
+    if relay_url:
+        st.caption(
+            "API：已启用中转（GOOGLE_GEMINI_BASE_URL / GEMINI_BASE_URL）。"
+            f"模型：`{_model_name()}`。请在同一终端启动 streamlit 前设置环境变量。"
+        )
+    else:
+        st.caption(f"API：直连 Google（未设置中转 BASE_URL）。模型：`{_model_name()}`。")
 
-    available = [n for n in TABLE_IMAGES if (BASE_DIR / n).exists()]
+    available = [n for n in TABLE_IMAGES if (IMAGE_ROOT / n).exists()]
     if not available:
-        st.error(f"未找到桌面图像。请将 table1.png / table2.jpg 等放在: {BASE_DIR}")
+        st.error(
+            f"未找到桌面图像。请将 table1.png / table2.jpg 等放在: {DATASET_DIR} "
+            f"（或脚本同目录: {BASE_DIR}）"
+        )
         return
 
     selected = st.selectbox("选择图像", available, key="table_select")
-    image_path = BASE_DIR / selected
+    image_path = IMAGE_ROOT / selected
     mime_type = get_mime(image_path)
 
     with open(image_path, "rb") as f:
@@ -481,7 +576,7 @@ def main():
         st.subheader("原始图像")
         st.image(image)
 
-    reference_available = (BASE_DIR / REFERENCE_IMAGE_NAME).exists() and selected != REFERENCE_IMAGE_NAME
+    reference_available = (IMAGE_ROOT / REFERENCE_IMAGE_NAME).exists() and selected != REFERENCE_IMAGE_NAME
     use_reference = st.checkbox(
         "使用参考图 table.png 辅助定位（将参考图与当前图一并发送，帮助模型理解“桌角点”含义）",
         value=True,
@@ -494,17 +589,33 @@ def main():
     detection_method = st.radio(
         "检测方式",
         options=[
-            "Gemini（视觉+几何推理）",
+            "仅 Gemini",
             "分割初定位 + Gemini 精修（推荐）",
         ],
         index=0,
         key="detection_method",
         horizontal=True,
     )
-    # 取消单独的“仅分割”选项：自动模式 = 分割 + 几何 + Gemini 兜底
     use_segment_then_gemini = detection_method.startswith("分割初定位")
     if use_segment_then_gemini and not _opencv_available():
         st.warning("当前未安装 OpenCV（opencv-python、numpy），分割初定位功能不可用。请安装后重试：pip install opencv-python numpy")
+
+    reasoning_mode = st.radio(
+        "角点推理策略（对比实验）",
+        options=[
+            "含数学几何推理（提示词 + 代码平行四边形）",
+            "仅大模型（无几何公式提示，无代码平行四边形 / 补点 / 边缘细化）",
+        ],
+        index=0,
+        key="reasoning_mode",
+        horizontal=True,
+    )
+    use_geometry_pipeline = reasoning_mode.startswith("含")
+    if use_segment_then_gemini and not use_geometry_pipeline:
+        st.info(
+            "「仅大模型」模式下不使用分割初定位（分割含凸包等几何先验）。本次将自动改为仅调用 Gemini。"
+        )
+    effective_segment = use_segment_then_gemini and use_geometry_pipeline and _opencv_available()
 
     with col2:
         st.subheader("四角点检测（红点 + 红色四边形）")
@@ -512,24 +623,37 @@ def main():
             corners = None
             raw_text = ""
             try:
-                if use_segment_then_gemini:
+
+                def _post_process_gemini_corners(
+                    pts: list[tuple[float, float]] | None,
+                ) -> list[tuple[float, float]] | None:
+                    if not pts or len(pts) != 4:
+                        return pts
+                    if not use_geometry_pipeline:
+                        return pts
+                    pts = _refine_corners_with_edges(image, pts)
+                    return _ensure_four_corners(pts) or pts
+
+                if effective_segment:
                     with st.spinner("先分割初定位，再调用 Gemini 精修..."):
                         seg_corners = segment_table_and_get_corners(image)
                         if seg_corners and len(seg_corners) == 4:
                             client = get_client()
                             ref_bytes = ref_mime = None
                             if use_reference and reference_available:
-                                with open(BASE_DIR / REFERENCE_IMAGE_NAME, "rb") as f:
+                                with open(IMAGE_ROOT / REFERENCE_IMAGE_NAME, "rb") as f:
                                     ref_bytes = f.read()
-                                ref_mime = get_mime(BASE_DIR / REFERENCE_IMAGE_NAME)
+                                ref_mime = get_mime(IMAGE_ROOT / REFERENCE_IMAGE_NAME)
                             corners, raw_text = run_gemini_corner_detection(
-                                client, image_bytes, mime_type,
+                                client,
+                                image_bytes,
+                                mime_type,
                                 reference_image_bytes=ref_bytes,
                                 reference_image_mime=ref_mime,
+                                use_geometry_pipeline=use_geometry_pipeline,
                             )
                             if corners and len(corners) == 4:
-                                corners = _refine_corners_with_edges(image, corners)
-                                corners = _ensure_four_corners(corners) or corners
+                                corners = _post_process_gemini_corners(corners)
                             else:
                                 corners = seg_corners
                                 raw_text = "（分割成功，Gemini 未返回有效角点，使用分割结果）"
@@ -537,37 +661,48 @@ def main():
                             client = get_client()
                             ref_bytes = ref_mime = None
                             if use_reference and reference_available:
-                                with open(BASE_DIR / REFERENCE_IMAGE_NAME, "rb") as f:
+                                with open(IMAGE_ROOT / REFERENCE_IMAGE_NAME, "rb") as f:
                                     ref_bytes = f.read()
-                                ref_mime = get_mime(BASE_DIR / REFERENCE_IMAGE_NAME)
+                                ref_mime = get_mime(IMAGE_ROOT / REFERENCE_IMAGE_NAME)
                             corners, raw_text = run_gemini_corner_detection(
-                                client, image_bytes, mime_type,
+                                client,
+                                image_bytes,
+                                mime_type,
                                 reference_image_bytes=ref_bytes,
                                 reference_image_mime=ref_mime,
+                                use_geometry_pipeline=use_geometry_pipeline,
                             )
                             if corners and len(corners) == 4:
-                                corners = _refine_corners_with_edges(image, corners)
-                                corners = _ensure_four_corners(corners) or corners
+                                corners = _post_process_gemini_corners(corners)
                 else:
-                    with st.spinner("正在调用 Gemini（含几何推理）..."):
+                    spin = (
+                        "正在调用 Gemini（含数学几何提示与后处理）..."
+                        if use_geometry_pipeline
+                        else "正在调用 Gemini（仅大模型：无几何公式提示与代码约束）..."
+                    )
+                    with st.spinner(spin):
                         client = get_client()
                         ref_bytes = ref_mime = None
                         if use_reference and reference_available:
-                            with open(BASE_DIR / REFERENCE_IMAGE_NAME, "rb") as f:
+                            with open(IMAGE_ROOT / REFERENCE_IMAGE_NAME, "rb") as f:
                                 ref_bytes = f.read()
-                            ref_mime = get_mime(BASE_DIR / REFERENCE_IMAGE_NAME)
+                            ref_mime = get_mime(IMAGE_ROOT / REFERENCE_IMAGE_NAME)
                         corners, raw_text = run_gemini_corner_detection(
-                            client, image_bytes, mime_type,
+                            client,
+                            image_bytes,
+                            mime_type,
                             reference_image_bytes=ref_bytes,
                             reference_image_mime=ref_mime,
+                            use_geometry_pipeline=use_geometry_pipeline,
                         )
                         if corners and len(corners) == 4:
-                            corners = _refine_corners_with_edges(image, corners)
-                            corners = _ensure_four_corners(corners) or corners
+                            corners = _post_process_gemini_corners(corners)
                 if corners and len(corners) == 4:
                     marked_image = draw_four_corners(image, corners)
                     st.image(marked_image)
+                    out_suffix = "_table_marked_geom.png" if use_geometry_pipeline else "_table_marked_llm.png"
                     st.json({
+                        "角点推理策略": reasoning_mode,
                         "corners": [
                             {"point": [round(c[0], 2), round(c[1], 2)], "label": f"corner_{i}"}
                             for i, c in enumerate(corners)
@@ -575,7 +710,7 @@ def main():
                         "说明": "归一化坐标 [y, x]，0-1000",
                     })
                     stem = image_path.stem
-                    output_path = BASE_DIR / f"{stem}_table_marked.png"
+                    output_path = image_path.parent / f"{stem}{out_suffix}"
                     marked_image.save(output_path)
                     st.success(f"已保存到新文件: {output_path}（原图未修改）")
                 else:
@@ -589,7 +724,9 @@ def main():
             st.info("选择检测方式后点击「运行检测」开始")
 
     st.caption(
-        "目标：识别桌子四角点。方法：利用桌子具有的几何性质（桌面为平面→正交下呈平行四边形），用公式 corner_3 = corner_0 + corner_2 - corner_1 推算被遮挡角点。table.png 为红点角点示例。"
+        "目标：识别桌子四角点。「含数学几何推理」在提示词与解析中利用平行四边形性质并可代码强制四角共面；"
+        "「仅大模型」不做公式提示、不补点、不强制平行四边形、不做 OpenCV 边缘细化，便于对比。"
+        "table.png 为红点角点参考示例。"
     )
 
 
