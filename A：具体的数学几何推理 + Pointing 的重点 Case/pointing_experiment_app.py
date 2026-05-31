@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import ast
 from io import BytesIO
 from pathlib import Path
 
@@ -85,46 +86,131 @@ def force_parallelogram(points: list[list[float]]) -> list[list[float]]:
     return [p0, p1, p2, clamp_point(y3, x3)]
 
 
-def parse_prediction(text: str, apply_geometry: bool) -> list[list[float]] | None:
-    match = re.search(r"\[[\s\S]*\]", text or "")
-    if not match:
-        return None
+def _extract_candidate_arrays(text: str) -> list[str]:
+    """提取文本中所有可能的 JSON 数组片段（按括号配对）。"""
+    candidates: list[str] = []
+    starts = [i for i, ch in enumerate(text) if ch == "["]
+    for start in starts:
+        depth = 0
+        for idx, ch in enumerate(text[start:], start):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start : idx + 1])
+                    break
+    return candidates
+
+
+def _load_json_like_array(candidate: str):
+    """优先按 JSON 解析，失败时用 literal_eval 容错（单引号等）。"""
+    cleaned = re.sub(r",\s*]", "]", candidate)
+    cleaned = re.sub(r",\s*}", "}", cleaned)
     try:
-        data = json.loads(match.group(0))
+        return json.loads(cleaned)
     except json.JSONDecodeError:
-        return None
-    if not isinstance(data, list):
+        pass
+    try:
+        return ast.literal_eval(cleaned)
+    except Exception:
         return None
 
-    indexed: dict[int, list[float]] = {}
-    unordered: list[list[float]] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        point = item.get("point")
-        if not isinstance(point, list) or len(point) < 2:
-            continue
-        parsed = clamp_point(point[0], point[1])
-        label = str(item.get("label", "")).lower().strip()
-        if label.startswith("corner_"):
-            try:
-                indexed[int(label.split("_")[-1])] = parsed
-                continue
-            except ValueError:
-                pass
-        unordered.append(parsed)
 
-    if len(indexed) == 4:
-        points = [indexed[i] for i in range(4)]
-    elif len(unordered) == 4:
-        points = sort_corners(unordered)
+def parse_prediction(text: str, apply_geometry: bool) -> tuple[list[list[float]] | None, str]:
+    if not text or not text.strip():
+        return None, "模型返回为空"
+
+    clean = text.strip()
+
+    # 兼容 ```json ... ``` / ``` ... ``` 包裹
+    lines = clean.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "```json":
+            clean = "\n".join(lines[i + 1 :]).split("```")[0].strip()
+            break
+    if "```" in clean and "[" not in clean[: clean.find("```")]:
+        code_block = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean)
+        if code_block:
+            clean = code_block.group(1).strip()
+
+    # 优先提取最外层 JSON 数组，避免正则贪婪导致解析失败
+    bracket_start = clean.find("[")
+    if bracket_start < 0:
+        # 兼容 {"points":[...]} / {"items":[...]} 结构
+        try:
+            obj = json.loads(clean)
+        except json.JSONDecodeError:
+            return None, "模型返回既不是数组，也不含 points/items 字段"
+        if isinstance(obj, dict):
+            if isinstance(obj.get("points"), list):
+                data = obj["points"]
+            elif isinstance(obj.get("items"), list):
+                data = obj["items"]
+            else:
+                return None, "对象结构中未找到 points/items 数组"
+        elif isinstance(obj, list):
+            data = obj
+        else:
+            return None, "模型返回顶层结构不是数组"
     else:
-        return None
+        data = None
+        for candidate in _extract_candidate_arrays(clean):
+            parsed = _load_json_like_array(candidate)
+            if isinstance(parsed, list):
+                # 优先选择“看起来像角点数组”的候选：元素为 dict 且含 point/x/y
+                looks_like_points = any(
+                    isinstance(it, dict)
+                    and ("point" in it or ("x" in it and "y" in it))
+                    for it in parsed
+                )
+                if looks_like_points:
+                    data = parsed
+                    break
+                if data is None:
+                    data = parsed
+        if data is None:
+            return None, "未找到可解析的数组片段"
 
-    return force_parallelogram(points) if apply_geometry else points
+    try:
+        if not isinstance(data, list):
+            return None, "解析后顶层不是数组"
+
+        indexed: dict[int, list[float]] = {}
+        unordered: list[list[float]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            point = item.get("point")
+            if point is None and "x" in item and "y" in item:
+                point = [item["y"], item["x"]]
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            parsed = clamp_point(point[0], point[1])
+            label = str(item.get("label", "")).lower().strip()
+            if label.startswith("corner_"):
+                try:
+                    indexed[int(label.split("_")[-1])] = parsed
+                    continue
+                except ValueError:
+                    pass
+            unordered.append(parsed)
+
+        if len(indexed) == 4:
+            points = [indexed[i] for i in range(4)]
+        elif len(unordered) == 4:
+            points = sort_corners(unordered)
+        else:
+            return None, "数组中未解析到 4 个有效角点"
+
+        return (force_parallelogram(points) if apply_geometry else points), "ok"
+    except Exception as exc:
+        return None, f"解析异常: {exc}"
 
 
-def call_model(client: genai.Client, image_path: Path, prompt: str, model_name: str) -> tuple[list[list[float]] | None, str]:
+def call_model(
+    client: genai.Client, image_path: Path, prompt: str, model_name: str
+) -> tuple[list[list[float]] | None, str, str]:
     image_bytes = image_path.read_bytes()
     mime_type = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
     response = client.models.generate_content(
@@ -136,7 +222,8 @@ def call_model(client: genai.Client, image_path: Path, prompt: str, model_name: 
         ),
     )
     raw_text = response.text or ""
-    return parse_prediction(raw_text, apply_geometry=(prompt == GEOMETRY_PROMPT)), raw_text
+    prediction, reason = parse_prediction(raw_text, apply_geometry=(prompt == GEOMETRY_PROMPT))
+    return prediction, raw_text, reason
 
 
 def point_error(pred: list[float], gt: list[float]) -> float:
@@ -206,8 +293,12 @@ def main() -> None:
     if st.button("运行对比实验", type="primary"):
         try:
             client = get_client()
-            baseline_pred, baseline_raw = call_model(client, image_path, BASELINE_PROMPT, get_model_name())
-            geometry_pred, geometry_raw = call_model(client, image_path, GEOMETRY_PROMPT, get_model_name())
+            baseline_pred, baseline_raw, baseline_reason = call_model(
+                client, image_path, BASELINE_PROMPT, get_model_name()
+            )
+            geometry_pred, geometry_raw, geometry_reason = call_model(
+                client, image_path, GEOMETRY_PROMPT, get_model_name()
+            )
 
             with col2:
                 st.subheader("Baseline：纯视觉判断")
@@ -218,6 +309,7 @@ def main() -> None:
                     st.json(baseline_pred)
                 else:
                     st.error("Baseline 未解析出有效角点。")
+                    st.caption(f"解析原因：{baseline_reason}")
                 with st.expander("查看 Baseline 原始输出"):
                     st.code(baseline_raw or "(empty)", language="text")
 
@@ -230,6 +322,7 @@ def main() -> None:
                     st.json(geometry_pred)
                 else:
                     st.error("Geometry 未解析出有效角点。")
+                    st.caption(f"解析原因：{geometry_reason}")
                 with st.expander("查看 Geometry 原始输出"):
                     st.code(geometry_raw or "(empty)", language="text")
 

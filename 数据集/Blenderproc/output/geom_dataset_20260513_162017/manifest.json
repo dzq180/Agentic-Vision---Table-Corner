@@ -1,0 +1,18 @@
+{
+  "run_name": "geom_dataset_20260513_162017",
+  "generated_at": "2026-05-13T16:26:18",
+  "num_samples": 1,
+  "image_size_wh": [
+    768,
+    768
+  ],
+  "image_dir": "D:\\大学\\计算机\\浙大wwg组面试\\Gemini Robotics-ER 1.5\\数据集\\Blenderproc\\output\\geom_dataset_20260513_162017\\images",
+  "gt_json_dir": "D:\\大学\\计算机\\浙大wwg组面试\\Gemini Robotics-ER 1.5\\数据集\\Blenderproc\\output\\geom_dataset_20260513_162017\\gt_json",
+  "files": [
+    {
+      "sample_id": "sample_00000",
+      "image": "sample_00000.png",
+      "gt_json": "sample_00000.json"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "image": "table1.png",
+    "mode": "baseline_visual_only",
+    "mean_corner_error": 110.5606,
+    "parallelogram_residual": 320.0578,
+    "raw_text": "```json\n[{\"point\": [704, 408], \"label\": \"corner_0\"}, {\"point\": [645, 729], \"label\": \"corner_1\"}, {\"point\": [749, 532], \"label\": \"corner_2\"}, {\"point\": [834, 530], \"label\": \"corner_3\"}]\n```",
+    "prediction": "[[704.0, 408.0], [645.0, 729.0], [749.0, 532.0], [834.0, 530.0]]"
+  },
+  {
+    "image": "table1.png",
+    "mode": "geometry_reasoning",
+    "mean_corner_error": 22.7249,
+    "parallelogram_residual": 0.0,
+    "raw_text": "```json\n[{\"point\":[661.0,411.0],\"label\":\"corner_0\"},{\"point\":[606.0,596.0],\"label\":\"corner_1\"},{\"point\":[656.0,736.0],\"label\":\"corner_2\"},{\"point\":[711.0,551.0],\"label\":\"corner_3\"}]\n```",
+    "prediction": "[[661.0, 411.0], [606.0, 596.0], [656.0, 736.0], [711.0, 551.0]]"
+  }
+]
